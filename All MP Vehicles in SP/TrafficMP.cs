@@ -1,40 +1,49 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Reflection;
-using System.Linq; 
 using GTA;
 using GTA.Math;
 using GTA.Native;
 
 public class TrafficMP : Script
 {
-    private Vehicle _spawnedVehicle;
-    private Ped _driver;
-    private Blip _trafficBlip;
+    private class GhostSlot
+    {
+        public Vehicle Vehicle;
+        public Ped Driver;
+        public Blip Blip;
+    }
+
+    private readonly List<GhostSlot> _slots = new List<GhostSlot>();
 
     private int _nextSpawnTime = 0;
     private int _nextSearchTime = 0;
+    private int _resumeSpawnTime = 0;
+    private bool _wasRestrictedState = false;
 
     private float SpawnDistance = 300.0f;
     private float DespawnDistance = 500.0f;
     private int RespawnDelayMs = 3000;
     private const int SearchIntervalMs = 500;
 
+    private const int MissionGraceMs = 5000;
+
     private int _blipColor;
     private int _trafficBlipConfig;
     private int _streetFlag;
+    private int _maxVehicles;
+    private int _clearAreaFlag;
 
     public static int disableTaxiFlag;
 
-    private int _spawnSequenceIndex = 0;
-    private Random _rnd = new Random();
+    private int _spawnCounter = 0;
+    private static readonly Random _rnd = new Random();
 
-    private HashSet<int> _dlcModelHashes = new HashSet<int>();
+    private readonly HashSet<int> _dlcModelHashes = new HashSet<int>();
     private int _lastPlayerVehicleHandle = 0;
 
-    // Список кодов богатых районов
-    private HashSet<string> _richZones = new HashSet<string>
+    private readonly HashSet<string> _richZones = new HashSet<string>
     {
         "RICHM",  // Richman
         "RGLEN",  // Richman Glen
@@ -49,21 +58,42 @@ public class TrafficMP : Script
         "OBSERV"  // Galileo Observatory
     };
 
+    private readonly HashSet<string> _blockedSpawnZones = new HashSet<string>
+    {
+        "AIRP",   // Los Santos International Airport
+        "ARMYB",  // Fort Zancudo
+        "JAIL"    // Bolingbroke Penitentiary
+    };
+
     public TrafficMP()
     {
         Tick += OnTick;
         Aborted += OnAborted;
 
-        ScriptSettings config = ScriptSettings.Load("Scripts\\AllMpVehiclesInSp.ini");
-        _blipColor = config.GetValue<int>("MAIN", "blip_color_traffic", 3);
-        _trafficBlipConfig = config.GetValue<int>("MAIN", "traffic_cars_blips", 0);
-        _streetFlag = config.GetValue<int>("MAIN", "spawn_traffic", 1);
-        RespawnDelayMs = config.GetValue<int>("MAIN", "time_traffic_gen", 3000);
+        try
+        {
+            ScriptSettings config = ScriptSettings.Load("Scripts\\AllMpVehiclesInSp.ini");
+            _blipColor = config.GetValue<int>("MAIN", "blip_color_traffic", 3);
+            _trafficBlipConfig = config.GetValue<int>("MAIN", "traffic_cars_blips", 0);
+            _streetFlag = config.GetValue<int>("MAIN", "spawn_traffic", 1);
+            RespawnDelayMs = config.GetValue<int>("MAIN", "time_traffic_gen", 3000);
 
-        SpawnDistance = config.GetValue<float>("ADVANCED", "SpawnDistance", 300.0f);
-        DespawnDistance = config.GetValue<float>("ADVANCED", "DespawnDistance", 500.0f);
+            _maxVehicles = config.GetValue<int>("MAIN", "max_traffic_vehicles", 3);
+            if (_maxVehicles < 1) _maxVehicles = 1;
+            if (_maxVehicles > 10) _maxVehicles = 10;
 
-        BuildDlcCache();
+            SpawnDistance = config.GetValue<float>("ADVANCED", "SpawnDistance", 300.0f);
+            DespawnDistance = config.GetValue<float>("ADVANCED", "DespawnDistance", 500.0f);
+
+            _clearAreaFlag = config.GetValue<int>("ADVANCED", "ClearSpawnArea", 0);
+
+            BuildDlcCache();
+        }
+        catch (Exception ex)
+        {
+            _streetFlag = 0;
+            Notifier.Show("~r~TrafficMP init error:~w~ " + ex.Message);
+        }
     }
 
     private void BuildDlcCache()
@@ -88,35 +118,55 @@ public class TrafficMP : Script
         }
         catch (Exception ex)
         {
-            GTA.UI.Notification.Show($"~r~TrafficMP Cache Error:~w~ {ex.Message}");
+            Notifier.Show("~r~TrafficMP Cache Error:~w~ " + ex.Message);
         }
+    }
+
+    private bool IsRestrictedGameState()
+    {
+        if (Game.IsLoading) return true;
+        if (Function.Call<bool>(Hash.GET_MISSION_FLAG)) return true;
+        if (Function.Call<bool>(Hash.IS_CUTSCENE_PLAYING)) return true;
+        if (Function.Call<bool>(Hash.IS_PLAYER_SWITCH_IN_PROGRESS)) return true;
+
+        Ped p = Game.Player.Character;
+        if (p == null || !p.Exists() || p.IsDead) return true;
+
+        return false;
     }
 
     private void OnTick(object sender, EventArgs e)
     {
         if (_streetFlag == 0) return;
 
+        if (IsRestrictedGameState())
+        {
+            if (!_wasRestrictedState)
+            {
+                ReleaseAll();
+                _wasRestrictedState = true;
+            }
+            return;
+        }
+
+        if (_wasRestrictedState)
+        {
+            _wasRestrictedState = false;
+            _resumeSpawnTime = Game.GameTime + MissionGraceMs;
+        }
+
+        if (Game.GameTime < _resumeSpawnTime) return;
+
         Ped player = Game.Player.Character;
 
-        // Логика DLC авто
         if (player.IsInVehicle())
         {
             Vehicle playerVeh = player.CurrentVehicle;
-
             if (playerVeh.Handle != _lastPlayerVehicleHandle)
             {
                 if (IsDlcVehicle(playerVeh))
-                {
-                    if (_spawnedVehicle != null || (_trafficBlip != null && _trafficBlip.Exists()))
-                    {
-                        ReleaseCurrentGhost();
-                        _nextSpawnTime = Game.GameTime + RespawnDelayMs;
-                    }
-                    else
-                    {
-                        _nextSpawnTime = Game.GameTime + RespawnDelayMs;
-                    }
-                }
+                    _nextSpawnTime = Game.GameTime + RespawnDelayMs;
+
                 _lastPlayerVehicleHandle = playerVeh.Handle;
             }
         }
@@ -125,22 +175,52 @@ public class TrafficMP : Script
             _lastPlayerVehicleHandle = 0;
         }
 
-        // Логика удаления по дистанции
-        if (_spawnedVehicle != null && _spawnedVehicle.Exists())
+        MaintainSlots(player);
+
+        if (_slots.Count < _maxVehicles &&
+            Game.GameTime >= _nextSpawnTime &&
+            Game.GameTime >= _nextSearchTime)
         {
-            if (player.Position.DistanceTo(_spawnedVehicle.Position) > DespawnDistance)
-            {
-                CleanUp();
-                _nextSpawnTime = Game.GameTime + RespawnDelayMs;
-            }
+            AttemptSpawnOptimized();
+            _nextSearchTime = Game.GameTime + SearchIntervalMs;
         }
-        // Логика спавна
-        else if (Game.GameTime >= _nextSpawnTime)
+    }
+
+    private void MaintainSlots(Ped player)
+    {
+        for (int i = _slots.Count - 1; i >= 0; i--)
         {
-            if (Game.GameTime >= _nextSearchTime)
+            GhostSlot slot = _slots[i];
+
+            if (slot.Vehicle == null || !slot.Vehicle.Exists() || slot.Vehicle.IsDead)
             {
-                AttemptSpawnOptimized();
-                _nextSearchTime = Game.GameTime + SearchIntervalMs;
+                ReleaseSlot(slot);
+                _slots.RemoveAt(i);
+                _nextSpawnTime = Game.GameTime + RespawnDelayMs;
+                continue;
+            }
+
+            if (player.IsInVehicle() && player.CurrentVehicle.Handle == slot.Vehicle.Handle)
+            {
+                ReleaseSlot(slot);
+                _slots.RemoveAt(i);
+                _nextSpawnTime = Game.GameTime + RespawnDelayMs;
+                continue;
+            }
+
+            if (slot.Driver == null || !slot.Driver.Exists() || slot.Driver.IsDead)
+            {
+                ReleaseSlot(slot);
+                _slots.RemoveAt(i);
+                _nextSpawnTime = Game.GameTime + RespawnDelayMs;
+                continue;
+            }
+
+            if (player.Position.DistanceTo(slot.Vehicle.Position) > DespawnDistance)
+            {
+                DeleteSlot(slot);
+                _slots.RemoveAt(i);
+                _nextSpawnTime = Game.GameTime + RespawnDelayMs;
             }
         }
     }
@@ -150,103 +230,228 @@ public class TrafficMP : Script
         return _dlcModelHashes.Contains(v.Model.Hash);
     }
 
-    private void ReleaseCurrentGhost()
+    private void ReleaseSlot(GhostSlot slot)
     {
-        if (_trafficBlip != null && _trafficBlip.Exists()) _trafficBlip.Delete();
-        _trafficBlip = null;
+        if (slot.Blip != null && slot.Blip.Exists()) slot.Blip.Delete();
+        slot.Blip = null;
 
-        if (_driver != null && _driver.Exists())
-        {
-            _driver.MarkAsNoLongerNeeded();
-            _driver = null;
-        }
+        if (slot.Driver != null && slot.Driver.Exists()) slot.Driver.MarkAsNoLongerNeeded();
+        slot.Driver = null;
 
-        if (_spawnedVehicle != null && _spawnedVehicle.Exists())
-        {
-            _spawnedVehicle.MarkAsNoLongerNeeded();
-            _spawnedVehicle = null;
-        }
-
-        _spawnedVehicle = null;
-        _driver = null;
+        if (slot.Vehicle != null && slot.Vehicle.Exists()) slot.Vehicle.MarkAsNoLongerNeeded();
+        slot.Vehicle = null;
     }
+
+    private void DeleteSlot(GhostSlot slot)
+    {
+        if (slot.Blip != null && slot.Blip.Exists()) slot.Blip.Delete();
+        if (slot.Driver != null && slot.Driver.Exists()) slot.Driver.Delete();
+        if (slot.Vehicle != null && slot.Vehicle.Exists()) slot.Vehicle.Delete();
+        slot.Blip = null;
+        slot.Driver = null;
+        slot.Vehicle = null;
+    }
+
+    private void ReleaseAll()
+    {
+        foreach (GhostSlot slot in _slots) ReleaseSlot(slot);
+        _slots.Clear();
+    }
+
+    private const int NodeFlagOffRoad = 1;
+    private const int NodeFlagSwitchedOff = 8;
+    private const int NodeFlagDeadEnd = 32;
+    private const int NodeFlagHighway = 64;
+    private const int NodeFlagJunction = 128;
+    private const int NodeFlagWater = 1024;
+
+    private const float LaneWidth = 5.4f;
 
     private void AttemptSpawnOptimized()
     {
         Ped playerPed = Game.Player.Character;
         Vector3 playerPos = playerPed.Position;
-        Vector3 playerForward = playerPed.ForwardVector;
 
-        Vector3 targetSearchPos = playerPos + (playerForward * SpawnDistance);
+        Vector3 searchDir = playerPed.IsInVehicle()
+            ? playerPed.CurrentVehicle.ForwardVector
+            : playerPed.ForwardVector;
+        searchDir.Z = 0f;
+        if (searchDir.LengthSquared() < 0.001f) searchDir = Vector3.RelativeFront;
+        searchDir.Normalize();
+
+        Vector3 searchPos = playerPos + searchDir * SpawnDistance;
+
+        Vector3 nodePos;
+        float nodeHeading;
+        bool isHighway;
+        if (!TryFindRoadNode(searchPos, searchDir, playerPos, out nodePos, out nodeHeading, out isHighway))
+            return;
+
+        string nodeZone = Function.Call<string>(Hash.GET_NAME_OF_ZONE, nodePos.X, nodePos.Y, nodePos.Z);
+        if (_blockedSpawnZones.Contains(nodeZone)) return;
+
+        Vector3 spawnPos;
+        float spawnHeading;
+        if (!TryGetLaneCenter(nodePos, nodeHeading, out spawnPos, out spawnHeading))
+        {
+            spawnPos = nodePos;
+            spawnHeading = nodeHeading;
+        }
+
+        if (_clearAreaFlag == 1)
+        {
+            Function.Call(Hash.CLEAR_AREA_OF_VEHICLES, spawnPos.X, spawnPos.Y, spawnPos.Z, 6.0f, false, false, false, false, false);
+        }
+        else
+        {
+            Vehicle[] occupying = World.GetNearbyVehicles(spawnPos, 7.0f);
+            if (occupying != null && occupying.Length > 0) return;
+        }
+
+        float cruiseSpeed = isHighway
+            ? 18.0f + (float)_rnd.NextDouble() * 5.0f
+            : 10.0f + (float)_rnd.NextDouble() * 4.0f;
+
+        float initialSpeed = cruiseSpeed;
+        Vehicle[] around = World.GetNearbyVehicles(spawnPos, 25.0f);
+        if (around != null && around.Length > 0) initialSpeed = 3.0f;
+
+        try
+        {
+            string modelToSpawn = GetNextModelName(spawnPos);
+            SpawnGhostCar(spawnPos, spawnHeading, modelToSpawn, cruiseSpeed, initialSpeed);
+        }
+        catch (Exception ex)
+        {
+            Notifier.Show("TrafficMP Spawn Error: " + ex.Message);
+        }
+    }
+
+    private bool TryFindRoadNode(Vector3 searchPos, Vector3 searchDir, Vector3 playerPos,
+        out Vector3 nodePos, out float nodeHeading, out bool isHighway)
+    {
+        nodePos = Vector3.Zero;
+        nodeHeading = 0f;
+        isHighway = false;
+
+        Vector3 desired = searchPos + searchDir * 100.0f;
 
         OutputArgument outPos = new OutputArgument();
         OutputArgument outHead = new OutputArgument();
 
-        Function.Call(Hash.GET_CLOSEST_VEHICLE_NODE_WITH_HEADING,
-            targetSearchPos.X, targetSearchPos.Y, targetSearchPos.Z,
-            outPos, outHead, 1, 3.0f, 0);
-
-        Vector3 spawnNodePos = outPos.GetResult<Vector3>();
-        float spawnNodeHeading = outHead.GetResult<float>();
-
-        if (spawnNodePos != Vector3.Zero)
+        for (int nth = 1; nth <= 6; nth++)
         {
-            if (playerPos.DistanceTo(spawnNodePos) > 60.0f)
-            {
-                try
-                {
-                    // Передаем позицию спавна для проверки зоны
-                    string modelToSpawn = GetNextModelName(spawnNodePos);
-                    SpawnGhostCar(spawnNodePos, spawnNodeHeading, modelToSpawn);
-                }
-                catch (Exception ex)
-                {
-                    GTA.UI.Notification.Show($"TrafficMP Spawn Error: {ex.Message}");
-                }
-            }
+            if (!Function.Call<bool>(Hash.GET_NTH_CLOSEST_VEHICLE_NODE_FAVOUR_DIRECTION,
+                searchPos.X, searchPos.Y, searchPos.Z,
+                desired.X, desired.Y, desired.Z,
+                nth, outPos, outHead, 0, 3.0f, 0.0f))
+                continue;
+
+            Vector3 p = outPos.GetResult<Vector3>();
+            if (p == Vector3.Zero) continue;
+
+            float dist = playerPos.DistanceTo(p);
+            if (dist <= 60.0f) continue;                    
+            if (dist >= DespawnDistance - 50.0f) continue; 
+
+            OutputArgument outDensity = new OutputArgument();
+            OutputArgument outFlags = new OutputArgument();
+            Function.Call<bool>(Hash.GET_VEHICLE_NODE_PROPERTIES, p.X, p.Y, p.Z, outDensity, outFlags);
+            int flags = outFlags.GetResult<int>();
+
+            if ((flags & (NodeFlagOffRoad | NodeFlagSwitchedOff | NodeFlagDeadEnd | NodeFlagJunction | NodeFlagWater)) != 0)
+                continue;
+
+            nodePos = p;
+            nodeHeading = outHead.GetResult<float>();
+            isHighway = (flags & NodeFlagHighway) != 0;
+            return true;
         }
+
+        return false;
     }
 
-    // Обновлен: принимает позицию для проверки зоны
+    private bool TryGetLaneCenter(Vector3 nodePos, float nodeHeading, out Vector3 lanePos, out float laneHeading)
+    {
+        lanePos = nodePos;
+        laneHeading = nodeHeading;
+
+        OutputArgument outNodeA = new OutputArgument();
+        OutputArgument outNodeB = new OutputArgument();
+        OutputArgument outLanesAB = new OutputArgument();
+        OutputArgument outLanesBA = new OutputArgument();
+        OutputArgument outMedian = new OutputArgument();
+
+        if (!Function.Call<bool>(Hash.GET_CLOSEST_ROAD,
+            nodePos.X, nodePos.Y, nodePos.Z, 1.0f, 1,
+            outNodeA, outNodeB, outLanesAB, outLanesBA, outMedian, false))
+            return false;
+
+        Vector3 a = outNodeA.GetResult<Vector3>();
+        Vector3 b = outNodeB.GetResult<Vector3>();
+        int lanesAB = outLanesAB.GetResult<int>();
+        int lanesBA = outLanesBA.GetResult<int>();
+        float median = outMedian.GetResult<float>();
+
+        Vector3 segFlat = new Vector3(b.X - a.X, b.Y - a.Y, 0f);
+        if (segFlat.LengthSquared() < 1.0f) return false;
+        if (lanesAB < 0 || lanesAB > 8 || lanesBA < 0 || lanesBA > 8 || lanesAB + lanesBA == 0) return false;
+        if (median < 0f || median > 15.0f) median = 0f;
+
+        float hRad = nodeHeading * (float)Math.PI / 180.0f;
+        Vector3 travelDir = new Vector3(-(float)Math.Sin(hRad), (float)Math.Cos(hRad), 0f);
+        Vector3 right = Vector3.Cross(travelDir, Vector3.WorldUp);
+
+        bool alongAB = Vector3.Dot(segFlat.Normalized, travelDir) >= 0f;
+        int laneCount = alongAB ? lanesAB : lanesBA;
+        int oppositeLanes = alongAB ? lanesBA : lanesAB;
+        if (laneCount <= 0) return false;
+
+        int maxLaneIndex = Math.Min(laneCount, 3) - 1;
+        int laneIndex = _rnd.Next(maxLaneIndex + 1);
+
+        for (int i = laneIndex; i >= 0; i--)
+        {
+            float offset;
+            if (oppositeLanes == 0)
+            {
+                offset = LaneWidth * (i + 0.5f) - (LaneWidth * laneCount) * 0.5f;
+            }
+            else
+            {
+                offset = median * 0.5f + LaneWidth * (i + 0.5f);
+            }
+
+            Vector3 candidate = nodePos + right * offset;
+            if (Function.Call<bool>(Hash.IS_POINT_ON_ROAD, candidate.X, candidate.Y, candidate.Z, 0))
+            {
+                lanePos = candidate;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     private string GetNextModelName(Vector3 spawnPos)
     {
-        if (_spawnSequenceIndex == 0)
+        _spawnCounter++;
+
+        if (_spawnCounter == 1)
         {
             if (VehList.models_latest.Count > 0)
                 return VehList.models_latest[_rnd.Next(VehList.models_latest.Count)];
-            else
-                return "vivanite2";
+            return "vivanite2";
         }
-        else if (_spawnSequenceIndex == 1)
-        {
-            if (disableTaxiFlag == 1)
-                return GetModelFromContext(spawnPos);
-            else
-                return "vivanite2";
-        }
-        else
-        {
-            return GetModelFromContext(spawnPos);
-        }
-    }
 
-    private void AdvanceSequence()
-    {
-        if (_spawnSequenceIndex == 0) _spawnSequenceIndex = 1;
-        else if (_spawnSequenceIndex == 1) _spawnSequenceIndex = 2;
-        else if (_spawnSequenceIndex == 2) _spawnSequenceIndex = 3;
-        else if (_spawnSequenceIndex == 3) _spawnSequenceIndex = 4;
-        else if (_spawnSequenceIndex == 4) _spawnSequenceIndex = 5;
-        else if (_spawnSequenceIndex == 5) _spawnSequenceIndex = 6;
-        else if (_spawnSequenceIndex == 6) _spawnSequenceIndex = 7;
-        else if (_spawnSequenceIndex == 7) _spawnSequenceIndex = 8;
-        else if (_spawnSequenceIndex == 8) _spawnSequenceIndex = 9;
-        else if (_spawnSequenceIndex == 9) _spawnSequenceIndex = 1;
+        if (disableTaxiFlag != 1 && _spawnCounter % 9 == 2)
+            return "vivanite2";
+
+        return GetModelFromContext(spawnPos);
     }
 
     private string GetModelFromContext(Vector3 position)
     {
-        // 1. Определяем зону в точке спавна
         string zoneName = Function.Call<string>(Hash.GET_NAME_OF_ZONE, position.X, position.Y, position.Z);
         bool isRichZone = _richZones.Contains(zoneName);
 
@@ -254,15 +459,11 @@ public class TrafficMP : Script
 
         if (isRichZone)
         {
-            // БОГАТАЯ ЗОНА: Только Super (7) или SportClassic (5, 6)
             int[] richClasses = { 5, 6, 7 };
             vclass = richClasses[_rnd.Next(richClasses.Length)];
         }
         else
         {
-            // ОБЫЧНАЯ ЗОНА: Исключаем 5, 6, 7
-
-            // Пытаемся найти машину рядом с игроком
             Vehicle[] nearbyVehs = World.GetNearbyVehicles(Game.Player.Character.Position, 100.0f);
             bool foundValid = false;
 
@@ -272,8 +473,7 @@ public class TrafficMP : Script
                 if (randomNeighbor.Exists())
                 {
                     int c = (int)randomNeighbor.ClassType;
-                    // Если класс машины допустим для бедной зоны (не 5,6,7 и валиден)
-                    if (c != 5 && c != 6 && c != 7 && c <= 13)
+                    if (c != 5 && c != 6 && c != 7 && c >= 0 && c <= 13)
                     {
                         vclass = c;
                         foundValid = true;
@@ -281,10 +481,8 @@ public class TrafficMP : Script
                 }
             }
 
-            // Если рядом ничего нет или попалась богатая машина, генерируем случайный "бедный" класс
             if (!foundValid)
             {
-                // Допустимые классы для обычных зон
                 int[] poorClasses = { 0, 1, 2, 3, 4, 8, 9, 10, 11, 12, 13 };
                 vclass = poorClasses[_rnd.Next(poorClasses.Length)];
             }
@@ -313,103 +511,101 @@ public class TrafficMP : Script
         return model_name;
     }
 
-    private string GetRandomModel(System.Collections.Generic.List<string> list)
+    private string GetRandomModel(List<string> list)
     {
         if (list == null || list.Count == 0) return "vivanite2";
         return list[_rnd.Next(list.Count)];
     }
 
-    private void SpawnGhostCar(Vector3 position, float heading, string modelName)
+    private void SpawnGhostCar(Vector3 position, float heading, string modelName, float cruiseSpeed, float initialSpeed)
     {
         Model carModel = new Model(modelName);
 
         if (!carModel.IsValid || !carModel.IsInCdImage)
         {
-            if (modelName != "vivanite2") SpawnGhostCar(position, heading, "vivanite2");
+            if (modelName != "vivanite2") SpawnGhostCar(position, heading, "vivanite2", cruiseSpeed, initialSpeed);
             return;
         }
 
-        if (!carModel.IsLoaded) carModel.Request();
-        if (!carModel.IsLoaded) return;
-
-        Function.Call(Hash.CLEAR_AREA_OF_VEHICLES, position.X, position.Y, position.Z, 6.0f, false, false, false, false, false);
-
-        _spawnedVehicle = World.CreateVehicle(carModel, position, heading);
-
-        if (_spawnedVehicle != null)
+        if (!carModel.Request(500))
         {
-            if (_trafficBlipConfig == 1) CreateMarkerAboveCar(_spawnedVehicle);
-
-            _spawnedVehicle.IsPersistent = true;
-            _spawnedVehicle.IsEngineRunning = true;
-            _spawnedVehicle.AreLightsOn = true;
-
-            if (modelName.ToLower() == "vivanite2")
-            {
-                _spawnedVehicle.Mods.CustomPrimaryColor = Color.White;
-                _spawnedVehicle.Mods.CustomSecondaryColor = Color.White;
-                Function.Call(Hash.SET_VEHICLE_MOD_KIT, _spawnedVehicle, 0);
-                Function.Call(Hash.SET_VEHICLE_MOD, _spawnedVehicle, 48, 0, false);
-                _spawnedVehicle.LockStatus = VehicleLockStatus.CannotEnter;
-
-                _driver = _spawnedVehicle.CreateRandomPedOnSeat(VehicleSeat.Driver);
-
-                if (_driver != null)
-                {
-                    _driver.IsVisible = false;
-                    _driver.CanBeTargetted = false;
-                    _driver.BlockPermanentEvents = true;
-                    _driver.IsInvincible = true;
-                    _driver.CanRagdoll = false;
-                    _driver.CanBeDraggedOutOfVehicle = false;
-                }
-            }
-            else
-            {
-                _driver = _spawnedVehicle.CreateRandomPedOnSeat(VehicleSeat.Driver);
-                if (_driver != null)
-                {
-                    _driver.IsVisible = true;
-                    _driver.CanBeTargetted = true;
-                    _driver.BlockPermanentEvents = false;
-                }
-            }
-
-            if (_driver != null && _driver.Exists())
-            {
-                _driver.Task.CruiseWithVehicle(_spawnedVehicle, 10.0f, DrivingStyle.Normal);
-            }
-
-            AdvanceSequence();
+            carModel.MarkAsNoLongerNeeded();
+            return;
         }
 
+        Vehicle vehicle = World.CreateVehicle(carModel, position, heading);
         carModel.MarkAsNoLongerNeeded();
+
+        if (vehicle == null) return;
+
+        Function.Call(Hash.SET_VEHICLE_ON_GROUND_PROPERLY, vehicle, 5.0f);
+
+        GhostSlot slot = new GhostSlot { Vehicle = vehicle };
+
+        vehicle.IsPersistent = true;
+        vehicle.IsEngineRunning = true;
+        vehicle.AreLightsOn = true;
+
+        if (modelName.ToLower() == "vivanite2")
+        {
+            vehicle.Mods.CustomPrimaryColor = Color.White;
+            vehicle.Mods.CustomSecondaryColor = Color.White;
+            Function.Call(Hash.SET_VEHICLE_MOD_KIT, vehicle, 0);
+            Function.Call(Hash.SET_VEHICLE_MOD, vehicle, 48, 0, false);
+            vehicle.LockStatus = VehicleLockStatus.CannotEnter;
+
+            slot.Driver = vehicle.CreateRandomPedOnSeat(VehicleSeat.Driver);
+            if (slot.Driver != null)
+            {
+                slot.Driver.IsVisible = false;
+                slot.Driver.CanBeTargetted = false;
+                slot.Driver.BlockPermanentEvents = true;
+                slot.Driver.IsInvincible = true;
+                slot.Driver.CanRagdoll = false;
+                slot.Driver.CanBeDraggedOutOfVehicle = false;
+            }
+        }
+        else
+        {
+            slot.Driver = vehicle.CreateRandomPedOnSeat(VehicleSeat.Driver);
+            if (slot.Driver != null)
+            {
+                slot.Driver.IsVisible = true;
+                slot.Driver.CanBeTargetted = true;
+                slot.Driver.BlockPermanentEvents = false;
+            }
+        }
+
+        if (slot.Driver == null || !slot.Driver.Exists())
+        {
+            vehicle.Delete();
+            return;
+        }
+
+        Function.Call(Hash.SET_DRIVER_ABILITY, slot.Driver, 1.0f);
+        Function.Call(Hash.SET_DRIVER_AGGRESSIVENESS, slot.Driver, 0.0f);
+        Function.Call(Hash.SET_VEHICLE_FORWARD_SPEED, vehicle, initialSpeed);
+
+        slot.Driver.Task.CruiseWithVehicle(vehicle, cruiseSpeed, DrivingStyle.Normal);
+
+        if (_trafficBlipConfig == 1)
+            slot.Blip = CreateMarkerAboveCar(vehicle);
+
+        _slots.Add(slot);
     }
 
-    private void CleanUp()
+    private Blip CreateMarkerAboveCar(Vehicle car)
     {
-        if (_driver != null && _driver.Exists()) _driver.Delete();
-        if (_spawnedVehicle != null && _spawnedVehicle.Exists()) _spawnedVehicle.Delete();
-        if (_trafficBlip != null && _trafficBlip.Exists()) _trafficBlip.Delete();
-
-        _spawnedVehicle = null;
-        _driver = null;
-        _trafficBlip = null;
-    }
-
-    private void CreateMarkerAboveCar(Vehicle car)
-    {
-        if (_trafficBlip != null && _trafficBlip.Exists()) _trafficBlip.Delete();
-
-        _trafficBlip = Function.Call<Blip>(Hash.ADD_BLIP_FOR_ENTITY, car);
-        Function.Call(Hash.SET_BLIP_SPRITE, _trafficBlip, 1);
-        Function.Call(Hash.SET_BLIP_COLOUR, _trafficBlip, _blipColor);
-        Function.Call(Hash.FLASH_MINIMAP_DISPLAY);
-        _trafficBlip.Name = "Unique vehicle";
+        Blip blip = Function.Call<Blip>(Hash.ADD_BLIP_FOR_ENTITY, car);
+        Function.Call(Hash.SET_BLIP_SPRITE, blip, 1);
+        Function.Call(Hash.SET_BLIP_COLOUR, blip, _blipColor);
+        blip.Name = "Unique vehicle";
+        return blip;
     }
 
     private void OnAborted(object sender, EventArgs e)
     {
-        CleanUp();
+        foreach (GhostSlot slot in _slots) DeleteSlot(slot);
+        _slots.Clear();
     }
 }
